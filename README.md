@@ -12,7 +12,61 @@ It is not a tutorial project. It processes real financial data.
 
 ---
 
-## Architecture
+## Production Deployment
+
+This service runs on an **AWS EC2 instance** with **Nginx as a reverse proxy**. A domain points to the EC2 public IP with SSL terminating at Nginx. The downstream PHP loan management system — hosted on shared hosting — consumes the EC2 APIs over HTTPS.
+
+```
+PHP Loan Management System
+     (shared hosting)
+           │
+           │  HTTPS requests to api.yourdomain.com
+           ▼
+  ┌─────────────────────┐
+  │   Nginx (EC2)        │  ← reverse proxy + SSL termination
+  │   Port 80/443        │
+  └────────┬────────────┘
+           │  proxy_pass to localhost:8000
+           ▼
+  ┌─────────────────────┐
+  │  FastAPI / Uvicorn   │  ← application server
+  │  (EC2, Port 8000)    │
+  └────────┬────────────┘
+           │
+           ▼
+  ┌─────────────────────┐
+  │  MySQL + Redis       │  ← data layer (same EC2)
+  └─────────────────────┘
+```
+
+**Nginx config pattern:**
+```nginx
+server {
+    listen 443 ssl;
+    server_name api.yourdomain.com;
+
+    ssl_certificate     /etc/letsencrypt/live/api.yourdomain.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/api.yourdomain.com/privkey.pem;
+
+    location / {
+        proxy_pass         http://127.0.0.1:8000;
+        proxy_set_header   Host $host;
+        proxy_set_header   X-Real-IP $remote_addr;
+        proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+    }
+}
+
+server {
+    listen 80;
+    server_name api.yourdomain.com;
+    return 301 https://$host$request_uri;
+}
+```
+
+---
+
+## Application Architecture
 
 ```
 FNBB Bank Statement (CSV)
@@ -100,23 +154,22 @@ Transaction references often contain vehicle registration plate numbers (Botswan
 
 ---
 
-## AWS-Equivalent Architecture
+## AWS Migration Path
 
-Built to run on Hostinger shared hosting. The cloud-native equivalent:
+The service already runs on EC2. Migrating fully to managed AWS services requires minimal changes:
 
-```
-CSV Upload      →  S3 + Lambda (parse trigger)
-MySQL           →  RDS MySQL
-Redis           →  ElastiCache Redis
-Payment publish →  SQS Queue → Lambda → PHP API
-Background tasks→  SQS + Lambda (async processing)
-Reports         →  S3 (generated files) + CloudFront
-FastAPI app     →  Lambda + API Gateway (via Mangum handler)
-Rate limiting   →  API Gateway throttling
-Auth            →  Cognito or custom JWT on Lambda
-```
+| Current | AWS Managed Equivalent |
+|---------|----------------------|
+| EC2 + Uvicorn | Keep EC2, or move to Lambda + API Gateway via `handler = Mangum(app)` |
+| Nginx on EC2 | AWS Application Load Balancer |
+| MySQL on EC2 | Amazon RDS MySQL |
+| Redis on EC2 | Amazon ElastiCache Redis |
+| Background tasks | Amazon SQS + Lambda |
+| CSV upload endpoint | S3 upload trigger → Lambda |
+| Reports | S3 storage + CloudFront |
+| Rate limiting | API Gateway throttling |
 
-The `handler = Mangum(app)` line at the bottom of `main.py` makes this deployable to AWS Lambda with zero code changes.
+The `handler = Mangum(app)` line at the bottom of `main.py` makes this deployable to AWS Lambda with zero code changes when needed.
 
 ---
 
@@ -132,42 +185,141 @@ The `handler = Mangum(app)` line at the bottom of `main.py` makes this deployabl
 
 ## Setup
 
-### 1. Clone and configure
+### Option A — EC2 + Nginx (Production, matches live deployment)
+
+#### 1. Launch EC2 instance
+```bash
+# Amazon Linux 2023 or Ubuntu 22.04, t2.micro or larger
+# Open security group ports: 22 (SSH), 80 (HTTP), 443 (HTTPS)
+```
+
+#### 2. Install dependencies on EC2
+```bash
+# Python 3.11
+sudo dnf install python3.11 python3.11-pip -y   # Amazon Linux
+# or
+sudo apt install python3.11 python3.11-pip -y    # Ubuntu
+
+# Nginx
+sudo dnf install nginx -y   # or apt install nginx -y
+
+# MySQL
+sudo dnf install mysql-server -y && sudo systemctl start mysqld
+
+# Redis
+sudo dnf install redis -y && sudo systemctl start redis
+```
+
+#### 3. Clone and configure
+```bash
+git clone https://github.com/mrmotsumi/fnbb-transaction-processor.git
+cd fnbb-transaction-processor
+cp app/.env.example app/.env
+nano app/.env   # fill in all values
+```
+
+Generate secrets:
+```bash
+python3 -c "import secrets; print(secrets.token_hex(32))"
+```
+
+#### 4. Install Python dependencies
+```bash
+pip3.11 install -r requirements.txt
+```
+
+#### 5. Run with systemd (keeps running after SSH disconnect)
+```bash
+sudo nano /etc/systemd/system/fnbb-api.service
+```
+
+```ini
+[Unit]
+Description=FNBB Transaction Processor
+After=network.target
+
+[Service]
+User=ec2-user
+WorkingDirectory=/home/ec2-user/fnbb-transaction-processor/app
+ExecStart=/usr/local/bin/uvicorn main:app --host 127.0.0.1 --port 8000
+Restart=always
+RestartSec=3
+Environment=PYTHONPATH=/home/ec2-user/fnbb-transaction-processor/app
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable fnbb-api
+sudo systemctl start fnbb-api
+```
+
+#### 6. Configure Nginx
+```bash
+sudo nano /etc/nginx/conf.d/fnbb-api.conf
+```
+
+```nginx
+server {
+    listen 80;
+    server_name api.yourdomain.com;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    server_name api.yourdomain.com;
+
+    ssl_certificate     /etc/letsencrypt/live/api.yourdomain.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/api.yourdomain.com/privkey.pem;
+
+    location / {
+        proxy_pass         http://127.0.0.1:8000;
+        proxy_set_header   Host $host;
+        proxy_set_header   X-Real-IP $remote_addr;
+        proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+        proxy_read_timeout 300s;
+        proxy_connect_timeout 75s;
+        client_max_body_size 260M;
+    }
+}
+```
+
+```bash
+sudo systemctl reload nginx
+```
+
+#### 7. SSL with Let's Encrypt (free)
+```bash
+sudo dnf install certbot python3-certbot-nginx -y
+sudo certbot --nginx -d api.yourdomain.com
+```
+
+---
+
+### Option B — Local Development
 
 ```bash
 git clone https://github.com/mrmotsumi/fnbb-transaction-processor.git
 cd fnbb-transaction-processor
 cp app/.env.example app/.env
-```
-
-Edit `app/.env` — fill in all required values. Generate secrets with:
-
-```bash
-python -c "import secrets; print(secrets.token_hex(32))"
-```
-
-### 2. Install dependencies
-
-```bash
 pip install -r requirements.txt
-```
-
-### 3. Start the application
-
-```bash
 cd app
 uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-The initial admin user is created automatically on first startup using `ADMIN_EMAIL` and `ADMIN_DEFAULT_PASSWORD` from your `.env`. **Change the password immediately after first login.**
+---
 
-### 4. Access the API docs
+### Option C — Docker (Local or EC2)
 
+```bash
+docker-compose up -d
 ```
-http://localhost:8000/docs
-```
 
-Docs are disabled in production (`ENVIRONMENT=production`).
+Includes MySQL and Redis. Edit `app/.env` before starting.
 
 ---
 
@@ -237,7 +389,8 @@ Docs are disabled in production (`ENVIRONMENT=production`).
 - Python 3.11+
 - MySQL 5.7+ / MariaDB 10.3+
 - Redis 6+
-- Any WSGI/ASGI host, or AWS Lambda via Mangum
+- Nginx (production) or any ASGI host
+- AWS EC2 or any Linux VPS, or AWS Lambda via Mangum
 
 ---
 
