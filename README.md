@@ -1,0 +1,250 @@
+# FNBB Transaction Processor
+
+> Production FastAPI service that parses FNBB CSV bank statements, classifies transactions as payments vs disbursements, publishes payments to a downstream PHP lending system, and generates Excel/PDF reports.
+
+---
+
+## What This Is
+
+A real production backend built to automate bank reconciliation for a regulated multi-branch lending platform. It eliminates manual CSV processing, ensures payments are correctly classified and published to the lending system, and gives branch managers instant Excel/PDF reports with a single API call.
+
+It is not a tutorial project. It processes real financial data.
+
+---
+
+## Architecture
+
+```
+FNBB Bank Statement (CSV)
+        │
+        ▼
+┌───────────────────────────────────────────────────────┐
+│            FastAPI Application                        │
+│                                                       │
+│  ┌─────────────────┐   ┌────────────────────────────┐ │
+│  │  CSV Parser      │   │  Auth & RBAC               │ │
+│  │  ─────────────  │   │  ──────────────────────    │ │
+│  │  Skip 4 headers │   │  Admin / Accountant /      │ │
+│  │  Parse amounts  │   │  Collection Officer roles  │ │
+│  │  SHA hash dedup │   │  JWT Bearer tokens         │ │
+│  │  Flag payments  │   └────────────────────────────┘ │
+│  │  vs disbursements│                                 │
+│  └─────────────────┘   ┌────────────────────────────┐ │
+│                         │  Redis Cache               │ │
+│  ┌─────────────────┐   │  ──────────────────────    │ │
+│  │  Payment        │   │  Daily summary  300s TTL   │ │
+│  │  Publisher      │   │  Transactions    60s TTL   │ │
+│  │  ─────────────  │   │  Reports       3600s TTL   │ │
+│  │  Exponential    │   └────────────────────────────┘ │
+│  │  back-off retry │                                  │
+│  │  Publish log    │   ┌────────────────────────────┐ │
+│  │  Status track   │   │  Plate Extractor           │ │
+│  └─────────────────┘   │  ──────────────────────    │ │
+│                         │  Regex plate detection     │ │
+│  ┌─────────────────┐   │  Excel VLOOKUP equivalent  │ │
+│  │  Report Engine  │   │  Batch plate matching      │ │
+│  │  ─────────────  │   └────────────────────────────┘ │
+│  │  Excel (.xlsx)  │                                  │
+│  │  PDF            │                                  │
+│  │  Daily summary  │                                  │
+│  └─────────────────┘                                  │
+└───────────────────────────────────────────────────────┘
+        │                       │
+        ▼                       ▼
+PHP Lending System        MySQL / MariaDB
+(payment publishing)      (transactions, users,
+                           publish logs, audit)
+```
+
+---
+
+## Key Features
+
+### FNBB CSV Parsing
+The FNBB bank statement CSV has 4 header lines before transaction data begins. The parser skips these automatically, handles quoted descriptions containing commas, and classifies each transaction:
+- **Positive amount** → Payment (credit / money received)
+- **Negative amount** → Disbursement (debit / money paid out)
+
+### SHA-Based Deduplication
+Every transaction generates a SHA hash from its date, amount, description, and source file. Re-uploading the same CSV never creates duplicates. The system reports exact counts of new vs duplicate transactions.
+
+### Payment Publishing
+Classified payment transactions are published to a downstream PHP lending system via REST API:
+- Exponential back-off retry: 1s → 2s → 4s per attempt
+- Every attempt logged to `payment_publish_logs` with status, error, and gateway response
+- Background (async) or synchronous mode
+- Webhook endpoint for PHP system to confirm receipt
+- Full publishing status API per transaction
+
+### Vehicle Plate Extraction
+Transaction references often contain vehicle registration plate numbers (Botswana format: `BXXXABC`). The plate extractor:
+- Scans all transaction descriptions with regex
+- Matches found plates against an uploaded Excel registration file
+- Returns owner details, amounts paid, and match statistics
+- Supports chunked reading for large Excel files (100k+ rows)
+
+### Report Generation
+- Excel reports: payments, disbursements, combined — with summary totals
+- PDF reports: formatted transaction listings
+- Daily summary API: net flow per upload date
+- All filterable by upload date, transaction date, or date range
+
+### Security
+- JWT Bearer token authentication
+- Role-based access: Admin, Accountant, Collection Officer
+- Rate limiting: 100/hour global, 5/minute on login
+- Security headers middleware (X-Frame-Options, CSP, XSS protection)
+- Request size validation (250 MB max)
+- All secrets loaded from environment — no hardcoded credentials
+- Docs endpoint disabled in production
+
+---
+
+## AWS-Equivalent Architecture
+
+Built to run on Hostinger shared hosting. The cloud-native equivalent:
+
+```
+CSV Upload      →  S3 + Lambda (parse trigger)
+MySQL           →  RDS MySQL
+Redis           →  ElastiCache Redis
+Payment publish →  SQS Queue → Lambda → PHP API
+Background tasks→  SQS + Lambda (async processing)
+Reports         →  S3 (generated files) + CloudFront
+FastAPI app     →  Lambda + API Gateway (via Mangum handler)
+Rate limiting   →  API Gateway throttling
+Auth            →  Cognito or custom JWT on Lambda
+```
+
+The `handler = Mangum(app)` line at the bottom of `main.py` makes this deployable to AWS Lambda with zero code changes.
+
+---
+
+## Database Tables
+
+| Table | Purpose |
+|-------|---------|
+| `bank_transactions` | All parsed transactions with payment/disbursement classification |
+| `payment_publish_logs` | Publishing history — status, attempt count, PHP response, errors |
+| `users` | Application users with roles |
+
+---
+
+## Setup
+
+### 1. Clone and configure
+
+```bash
+git clone https://github.com/mrmotsumi/fnbb-transaction-processor.git
+cd fnbb-transaction-processor
+cp app/.env.example app/.env
+```
+
+Edit `app/.env` — fill in all required values. Generate secrets with:
+
+```bash
+python -c "import secrets; print(secrets.token_hex(32))"
+```
+
+### 2. Install dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+### 3. Start the application
+
+```bash
+cd app
+uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+The initial admin user is created automatically on first startup using `ADMIN_EMAIL` and `ADMIN_DEFAULT_PASSWORD` from your `.env`. **Change the password immediately after first login.**
+
+### 4. Access the API docs
+
+```
+http://localhost:8000/docs
+```
+
+Docs are disabled in production (`ENVIRONMENT=production`).
+
+---
+
+## API Endpoints
+
+### Authentication
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/auth/login` | Login — returns JWT token |
+| GET | `/auth/me` | Current user profile |
+| PUT | `/auth/change-password` | Change password |
+
+### Transactions
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/upload-csv/` | Upload FNBB CSV statement |
+| GET | `/transactions/` | List transactions |
+| GET | `/upload-dates/` | All unique upload dates |
+
+### Payments
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/payments/publish` | Publish payments to PHP system |
+| GET | `/payments/publish/status/{id}` | Publishing status for a transaction |
+| GET | `/payments/publish/summary` | Publishing summary stats |
+| GET | `/payments/by-plate/{plate}` | Payments by vehicle plate |
+| POST | `/payments/by-plates/batch` | Batch plate payment lookup |
+
+### Reports & Downloads
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/reports/daily-summary/` | Daily payment/disbursement summary |
+| GET | `/reports/payments/` | Payment listing |
+| GET | `/reports/disbursements/` | Disbursement listing |
+| GET | `/download/payments/excel` | Download payments as Excel |
+| GET | `/download/disbursements/excel` | Download disbursements as Excel |
+| GET | `/download/payments/pdf` | Download payments as PDF |
+| GET | `/download/combined/excel` | Download combined report |
+
+### System
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/health/` | Health check (DB + Redis) |
+| GET | `/system/status` | System info and uptime |
+
+---
+
+## Environment Variables Reference
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `SECRET_KEY` | ✅ | App signing secret (32+ chars) |
+| `JWT_SECRET_KEY` | ✅ | JWT signing secret (32+ chars) |
+| `DB_PASSWORD` | ✅ | MySQL password |
+| `PHP_API_BASE_URL` | ✅ | Downstream PHP system base URL |
+| `PHP_API_KEY` | ✅ | PHP system API key |
+| `ADMIN_DEFAULT_PASSWORD` | ✅ | Initial admin password (change after setup) |
+| `ENVIRONMENT` | ✅ | `development` / `staging` / `production` |
+| `REDIS_URL` | ✅ | Redis connection URL |
+| `REPORT_ACCOUNT_NAME` | ✅ | Account name for report headers |
+| `REPORT_ACCOUNT_NUMBER` | ✅ | Account number for report headers |
+
+---
+
+## Requirements
+
+- Python 3.11+
+- MySQL 5.7+ / MariaDB 10.3+
+- Redis 6+
+- Any WSGI/ASGI host, or AWS Lambda via Mangum
+
+---
+
+## License
+
+MIT — free to use, adapt, and build on.
+
+---
+
+*Extracted and anonymised from a production financial platform regulated by a national financial services authority. Account details, credentials, and personal data have been removed. Core business logic and architecture are unchanged.*
